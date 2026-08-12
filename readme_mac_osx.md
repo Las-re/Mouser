@@ -45,7 +45,7 @@ If Accessibility is not granted, Mouser will print:
 | Mouse hook | SetWindowsHookExW (LL hook) | CGEventTap |
 | Key simulation | SendInput (VK codes) | CGEvent (CGKeyCodes) |
 | Media keys | VK_MEDIA_* constants | NSEvent (NX key IDs) |
-| App detection | GetForegroundWindow | NSWorkspace.frontmostApplication |
+| App detection | GetForegroundWindow | NSWorkspace activation notifications |
 | Gesture button | HID++ + Raw Input fallback | HID++ + event-tap movement |
 | Scroll inversion | Coalesced SendInput | CGEventCreateScrollWheelEvent |
 | Modifier key | Ctrl | Cmd (⌘) |

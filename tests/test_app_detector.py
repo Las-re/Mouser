@@ -4,6 +4,7 @@ import plistlib
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -136,6 +137,61 @@ class AppDetectorMacOSTests(unittest.TestCase):
                     "Editor",
                 ),
             )
+
+    def test_macos_uses_activation_notifications_instead_of_polling(self):
+        class FakeNotificationCenter:
+            def __init__(self):
+                self.callback = None
+                self.removed = None
+
+            def addObserverForName_object_queue_usingBlock_(
+                self, name, obj, queue, callback
+            ):
+                self.name = name
+                self.callback = callback
+                return "observer-token"
+
+            def removeObserver_(self, observer):
+                self.removed = observer
+
+        center = FakeNotificationCenter()
+        workspace = SimpleNamespace(notificationCenter=lambda: center)
+        appkit = SimpleNamespace(
+            NSWorkspace=SimpleNamespace(sharedWorkspace=lambda: workspace)
+        )
+        changes = []
+
+        with (
+            patch.object(self.module.sys, "platform", "darwin"),
+            patch.dict(sys.modules, {"AppKit": appkit}),
+            patch.object(
+                self.module,
+                "get_foreground_app_identity",
+                return_value=("startup.app",),
+            ) as foreground,
+            patch.object(
+                self.module,
+                "_macos_running_app_identities",
+                return_value=("activated.app",),
+            ),
+        ):
+            detector = self.module.AppDetector(changes.append)
+            detector.start()
+
+            self.assertEqual(
+                center.name,
+                "NSWorkspaceDidActivateApplicationNotification",
+            )
+            self.assertIsNone(detector._thread)
+            self.assertEqual(changes, [("startup.app",)])
+
+            center.callback(SimpleNamespace(object=lambda: object()))
+            self.assertEqual(changes, [("startup.app",), ("activated.app",)])
+            foreground.assert_called_once_with()
+
+            detector.stop()
+
+        self.assertEqual(center.removed, "observer-token")
 
 
 class ExplorerWindowTriageTests(unittest.TestCase):

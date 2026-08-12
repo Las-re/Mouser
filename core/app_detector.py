@@ -1,8 +1,9 @@
 """
-Foreground application detector — polls the active window and fires
-a callback when the foreground app changes.
+Foreground application detector — fires a callback when the foreground app
+changes.
 Windows: GetForegroundWindow + QueryFullProcessImageNameW (with UWP resolution).
-macOS:   NSWorkspace.sharedWorkspace().frontmostApplication().
+macOS:   NSWorkspace application-activation notifications.
+Linux:   xdotool/kdotool polling.
 """
 
 import functools
@@ -11,6 +12,7 @@ import plistlib
 import sys
 import threading
 import time
+import weakref
 
 
 # ── Windows explorer.exe window triage (platform-independent policy) ─────────
@@ -418,8 +420,15 @@ else:
 
 class AppDetector:
     """
-    Polls the foreground window every *interval* seconds.
-    Calls ``on_change(app_identity)`` when the foreground app changes.
+    Detects foreground application changes and calls ``on_change``.
+
+    macOS uses NSWorkspace activation notifications so it does not repeatedly
+    call ``frontmostApplication()``. That call creates a native
+    ``GPProcessMonitor`` tree on some macOS releases, and polling it every
+    300ms caused the tree to grow for the lifetime of the process. The
+    notification contains the activated ``NSRunningApplication`` directly.
+    The polling implementation remains the fallback for other platforms and
+    for macOS versions where observer registration is unavailable.
     """
 
     def __init__(self, on_change, interval: float = 0.3):
@@ -428,27 +437,92 @@ class AppDetector:
         self._last_app_identity: tuple[str, ...] | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._workspace_notification_center = None
+        self._workspace_observer = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
             return
+        if self._workspace_observer is not None:
+            return
         self._stop.clear()
+
+        if sys.platform == "darwin" and self._start_macos_observer():
+            # Preserve the old startup behavior: select the correct profile
+            # immediately, while all subsequent changes arrive as events.
+            self._process_identity(get_foreground_app_identity())
+            return
+
         self._thread = threading.Thread(target=self._poll, daemon=True, name="AppDetector")
         self._thread.start()
 
     def stop(self):
         self._stop.set()
+        self._stop_macos_observer()
         if self._thread:
             self._thread.join(timeout=2)
+            self._thread = None
+
+    def _start_macos_observer(self) -> bool:
+        """Register for app activation events, returning whether it worked."""
+        try:
+            from AppKit import NSWorkspace
+
+            notification_center = NSWorkspace.sharedWorkspace().notificationCenter()
+            detector_ref = weakref.ref(self)
+
+            def _on_activation(notification):
+                detector = detector_ref()
+                if detector is not None and not detector._stop.is_set():
+                    detector._process_macos_activation(notification)
+
+            observer = notification_center.addObserverForName_object_queue_usingBlock_(
+                "NSWorkspaceDidActivateApplicationNotification",
+                None,
+                None,
+                _on_activation,
+            )
+            if observer is None:
+                return False
+        except Exception as exc:
+            print(f"[AppDetect] macOS activation observer unavailable: {exc}")
+            return False
+
+        self._workspace_notification_center = notification_center
+        self._workspace_observer = observer
+        return True
+
+    def _stop_macos_observer(self):
+        center = self._workspace_notification_center
+        observer = self._workspace_observer
+        self._workspace_notification_center = None
+        self._workspace_observer = None
+        if center is not None and observer is not None:
+            try:
+                center.removeObserver_(observer)
+            except Exception:
+                pass
+
+    def _process_macos_activation(self, notification):
+        """Process an NSWorkspace activation notification without polling."""
+        app = _call_ns_method(notification, "object")
+        app_identity = _macos_running_app_identities(app) if app is not None else ()
+        if not app_identity:
+            # Some notification shims do not expose the object. This is a
+            # compatibility fallback, not the normal event-driven path.
+            app_identity = get_foreground_app_identity()
+        self._process_identity(app_identity)
+
+    def _process_identity(self, app_identity):
+        if app_identity and app_identity != self._last_app_identity:
+            self._last_app_identity = app_identity
+            self._on_change(app_identity)
 
     # ------------------------------------------------------------------
     def _poll(self):
         while not self._stop.is_set():
             try:
-                app_identity = get_foreground_app_identity()
-                if app_identity and app_identity != self._last_app_identity:
-                    self._last_app_identity = app_identity
-                    self._on_change(app_identity)
+                self._process_identity(get_foreground_app_identity())
             except Exception:
                 pass
             self._stop.wait(self._interval)
