@@ -104,6 +104,18 @@ class HidBackendPreferenceTests(unittest.TestCase):
         self.assertEqual(hid_gesture._default_backend_preference("win32"), "auto")
         self.assertEqual(hid_gesture._default_backend_preference("linux"), "auto")
 
+    def test_mac_hidapi_nonexclusive_setter_is_configured(self):
+        setter = Mock()
+        fake_hid = SimpleNamespace(hid_darwin_set_open_exclusive=setter)
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(hid_gesture, "HIDAPI_OK", True),
+            patch.object(hid_gesture, "_hid", fake_hid),
+        ):
+            self.assertTrue(hid_gesture._configure_hidapi_nonexclusive())
+
+        setter.assert_called_once_with(0)
+
 
 class GestureCandidateSelectionTests(unittest.TestCase):
     def test_choose_gesture_candidates_prefers_known_device_cids(self):

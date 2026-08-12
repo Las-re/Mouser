@@ -279,7 +279,7 @@ Parsed in [`main_qml.py`](main_qml.py) (`_parse_cli_args`):
 | Flag | Behavior |
 |---|---|
 | `--start-hidden` | Boot directly into the tray / menu bar; combined with the `start_minimized` config preference. |
-| `--hid-backend=<auto\|hidapi\|iokit>` | Force a specific HID transport. macOS defaults to `iokit`; other platforms default to `auto`. Use only for debugging. |
+| `--hid-backend=<auto\|hidapi\|iokit>` | Force a specific HID transport. `auto` prefers macOS hidapi in non-exclusive mode when available, then falls back to IOKit; use `iokit` or `hidapi` to debug a transport specifically. |
 
 Example:
 

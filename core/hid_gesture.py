@@ -31,6 +31,8 @@ from core.logi_devices import (
 )
 
 _HID_MODULE_NAME = None
+_HIDAPI_DARWIN_LIB = None
+_HIDAPI_NONEXCLUSIVE_CONFIGURED = False
 try:
     # The PyPI hidapi Linux wheels expose `hid` as the libusb backend and
     # `hidraw` as the hidraw backend. Bluetooth HID devices only work through
@@ -48,12 +50,43 @@ try:
         _HID_MODULE_NAME = "hid"
     HIDAPI_OK = True
     HIDAPI_IMPORT_ERROR = None
-    # On macOS, allow non-exclusive HID access so the mouse keeps working
-    if sys.platform == "darwin" and hasattr(_hid, "hid_darwin_set_open_exclusive"):
-        _hid.hid_darwin_set_open_exclusive(0)
 except Exception as exc:
     HIDAPI_OK = False
     HIDAPI_IMPORT_ERROR = exc
+
+
+def _configure_hidapi_nonexclusive():
+    """Keep hidapi from taking exclusive ownership of a macOS mouse.
+
+    Recent macOS hidapi wheels export ``hid_darwin_set_open_exclusive`` from
+    the extension but do not expose it as a Python attribute.  Calling the
+    exported symbol lets us use hidapi without suppressing the system mouse
+    stream, and avoids the Python ctypes/IOHID input callback path that has
+    shown unbounded native memory growth on macOS 26.
+    """
+    global _HIDAPI_DARWIN_LIB
+    if not HIDAPI_OK or sys.platform != "darwin":
+        return False
+
+    try:
+        setter = getattr(_hid, "hid_darwin_set_open_exclusive", None)
+        if setter is None:
+            import ctypes as _ctypes
+
+            _HIDAPI_DARWIN_LIB = _ctypes.CDLL(_hid.__file__)
+            setter = _HIDAPI_DARWIN_LIB.hid_darwin_set_open_exclusive
+            setter.argtypes = [_ctypes.c_int]
+            setter.restype = None
+        setter(0)
+        return True
+    except Exception as exc:
+        print(f"[HidGesture] hidapi non-exclusive mode unavailable: {exc}")
+        return False
+
+
+_HIDAPI_NONEXCLUSIVE_CONFIGURED = _configure_hidapi_nonexclusive()
+if _HIDAPI_NONEXCLUSIVE_CONFIGURED:
+    print("[HidGesture] hidapi macOS non-exclusive mode enabled")
 
 # Support both hidapi/hidraw-style modules (device) and "pip install hid" (Device).
 _HID_API_STYLE = None
@@ -2981,8 +3014,26 @@ class HidGestureListener:
             open_attempts = []
             candidate_transport = (info.get("transport") or "").lower()
             is_bt_candidate = "bluetooth" in candidate_transport
-            # On macOS, prefer IOKit (non-exclusive access) over hidapi
-            # which may lock the device and freeze the cursor.
+            # On macOS, prefer hidapi when its non-exclusive mode is
+            # available.  This avoids the Python ctypes/IOHID input callback
+            # path, whose native event allocations grow on macOS 26.  Keep
+            # IOKit as a fallback for older hidapi builds and for candidates
+            # that do not expose a hidapi path.
+            hidapi_first = (
+                _BACKEND_PREFERENCE == "hidapi"
+                or (
+                    sys.platform == "darwin"
+                    and _BACKEND_PREFERENCE == "auto"
+                    and _HIDAPI_NONEXCLUSIVE_CONFIGURED
+                )
+            )
+            if (
+                hidapi_first
+                and _BACKEND_PREFERENCE in ("auto", "hidapi")
+                and info.get("path")
+            ):
+                open_attempts.append(("hidapi", info))
+
             if (
                 sys.platform == "darwin"
                 and _MAC_NATIVE_OK
@@ -2997,7 +3048,11 @@ class HidGestureListener:
                         "usage": 0,
                         "transport": "Bluetooth Low Energy",
                     }))
-            if _BACKEND_PREFERENCE in ("auto", "hidapi") and info.get("path"):
+            if (
+                not hidapi_first
+                and _BACKEND_PREFERENCE in ("auto", "hidapi")
+                and info.get("path")
+            ):
                 open_attempts.append(("hidapi", info))
 
             for transport, open_info in open_attempts:
