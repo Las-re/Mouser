@@ -1,6 +1,7 @@
 import contextlib
 import importlib
 import os
+import queue
 import sys
 import tempfile
 import time
@@ -41,6 +42,18 @@ class HidModuleImportTests(unittest.TestCase):
         self.assertTrue(module.HIDAPI_OK)
         self.assertIs(module._hid, fake_hid)
         self.assertEqual(module._HID_MODULE_NAME, "hid")
+
+    def test_bounded_report_queue_discards_oldest_report(self):
+        report_queue = queue.Queue(maxsize=2)
+
+        hid_gesture._enqueue_bounded_hid_report(report_queue, b"old-1")
+        hid_gesture._enqueue_bounded_hid_report(report_queue, b"old-2")
+        hid_gesture._enqueue_bounded_hid_report(report_queue, b"new")
+
+        self.assertEqual(
+            [report_queue.get_nowait(), report_queue.get_nowait()],
+            [b"old-2", b"new"],
+        )
 
 
 class HidLinuxDiagnosticsTests(unittest.TestCase):

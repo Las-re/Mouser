@@ -69,6 +69,29 @@ _ATEXIT_LISTENERS = weakref.WeakSet()
 _ATEXIT_REGISTERED = False
 _ATEXIT_LOCK = threading.Lock()
 
+# The IOKit input callback must never block, and a stalled reader should not
+# allow native report bytes to accumulate without limit.  Keep the newest
+# reports so recovery reflects the current device state.
+_MAC_NATIVE_REPORT_QUEUE_MAXSIZE = 512
+
+
+def _enqueue_bounded_hid_report(report_queue, report) -> None:
+    try:
+        report_queue.put_nowait(report)
+        return
+    except queue.Full:
+        pass
+
+    try:
+        report_queue.get_nowait()
+    except queue.Empty:
+        pass
+
+    try:
+        report_queue.put_nowait(report)
+    except queue.Full:
+        pass
+
 
 # Last-known-good (transport, PID, dev_idx, ...) cache for sub-second
 # warm-start device detection. Schema is additive: unknown keys ignored.
@@ -497,7 +520,7 @@ if _MAC_NATIVE_OK:
             self._run_loop = None
             self._input_buffer = None
             self._report_callback = None
-            self._report_queue = queue.Queue()
+            self._report_queue = queue.Queue(maxsize=_MAC_NATIVE_REPORT_QUEUE_MAXSIZE)
 
         @staticmethod
         def _cfstring(text):
@@ -738,7 +761,7 @@ if _MAC_NATIVE_OK:
             self._run_loop = None
             self._input_buffer = None
             self._report_callback = None
-            self._report_queue = queue.Queue()
+            self._report_queue = queue.Queue(maxsize=_MAC_NATIVE_REPORT_QUEUE_MAXSIZE)
 
         def set_nonblocking(self, _enabled):
             return None
@@ -762,10 +785,12 @@ if _MAC_NATIVE_OK:
             if result != 0 or report_length <= 0:
                 return
             try:
-                self._report_queue.put_nowait(
-                    ctypes.string_at(report, int(report_length))
+                _enqueue_bounded_hid_report(
+                    self._report_queue,
+                    ctypes.string_at(report, int(report_length)),
                 )
             except Exception:
+                # Never let an exception escape through the IOKit callback.
                 pass
 
         def read(self, _size, timeout_ms=0):

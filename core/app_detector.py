@@ -6,6 +6,7 @@ macOS:   NSWorkspace application-activation notifications.
 Linux:   xdotool/kdotool polling.
 """
 
+import contextlib
 import functools
 import os
 import plistlib
@@ -109,6 +110,13 @@ def _dedupe_keep_order(values) -> tuple[str, ...]:
 
 def _single_identity(value: str | None) -> tuple[str, ...]:
     return (value,) if value else ()
+
+
+def _macos_autorelease_pool():
+    objc = globals().get("_objc")
+    if objc is None:
+        return contextlib.nullcontext()
+    return objc.autorelease_pool()
 
 
 def _macos_app_bundles_in_path(path: str | None) -> tuple[str, ...]:
@@ -505,13 +513,20 @@ class AppDetector:
 
     def _process_macos_activation(self, notification):
         """Process an NSWorkspace activation notification without polling."""
-        app = _call_ns_method(notification, "object")
-        app_identity = _macos_running_app_identities(app) if app is not None else ()
-        if not app_identity:
-            # Some notification shims do not expose the object. This is a
-            # compatibility fallback, not the normal event-driven path.
-            app_identity = get_foreground_app_identity()
-        self._process_identity(app_identity)
+        # Notification blocks run on an AppKit-owned thread.  Without an
+        # explicit pool, autoreleased NSRunningApplication/NSURL/Foundation
+        # objects can survive until that thread's pool drains, which is not
+        # frequent or predictable for this callback path.
+        with _macos_autorelease_pool():
+            app = _call_ns_method(notification, "object")
+            app_identity = (
+                _macos_running_app_identities(app) if app is not None else ()
+            )
+            if not app_identity:
+                # Some notification shims do not expose the object. This is a
+                # compatibility fallback, not the normal event-driven path.
+                app_identity = get_foreground_app_identity()
+            self._process_identity(app_identity)
 
     def _process_identity(self, app_identity):
         if app_identity and app_identity != self._last_app_identity:

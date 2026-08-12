@@ -161,9 +161,28 @@ class AppDetectorMacOSTests(unittest.TestCase):
         )
         changes = []
 
+        class TrackingPool:
+            def __init__(self):
+                self.entered = 0
+                self.exited = 0
+
+            def __enter__(self):
+                self.entered += 1
+                return self
+
+            def __exit__(self, *_args):
+                self.exited += 1
+
+        pool = TrackingPool()
+
         with (
             patch.object(self.module.sys, "platform", "darwin"),
             patch.dict(sys.modules, {"AppKit": appkit}),
+            patch.object(
+                self.module,
+                "_macos_autorelease_pool",
+                return_value=pool,
+            ),
             patch.object(
                 self.module,
                 "get_foreground_app_identity",
@@ -188,6 +207,8 @@ class AppDetectorMacOSTests(unittest.TestCase):
             center.callback(SimpleNamespace(object=lambda: object()))
             self.assertEqual(changes, [("startup.app",), ("activated.app",)])
             foreground.assert_called_once_with()
+            self.assertEqual(pool.entered, 1)
+            self.assertEqual(pool.exited, 1)
 
             detector.stop()
 
