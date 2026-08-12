@@ -1055,6 +1055,24 @@ class MacOSTrackpadScrollFilterTests(unittest.TestCase):
         event = hook._dispatch_queue.get_nowait()
         self.assertEqual(event.event_type, mouse_hook.MouseEvent.HSCROLL_RIGHT)
 
+    def test_unmapped_vertical_wheel_uses_pass_through_fast_path(self):
+        """A plain vertical wheel must not cross Quartz for unused scroll work."""
+        hook = mouse_hook.MouseHook()
+        hook._running = True
+        hook._connected_device = SimpleNamespace(
+            key="m720_triathlon",
+            thumb_button_via_hid=False,
+            gesture_via_sense_panel=False,
+        )
+        cg_event = MagicMock(name="cg_event")
+
+        result = hook._event_tap_callback(
+            None, self._kCGEventScrollWheel, cg_event, None)
+
+        self.assertIs(result, cg_event)
+        self.mock_quartz.CGEventGetIntegerValueField.assert_not_called()
+        self.assertTrue(hook._dispatch_queue.empty())
+
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS-only tests")
 class MacOSPassthroughWhenNoDeviceTests(unittest.TestCase):

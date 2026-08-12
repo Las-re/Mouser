@@ -381,6 +381,30 @@ class _HidDeviceCompat:
         self._dev.close()
 
 _MAC_NATIVE_OK = False
+
+
+class _NoopAutoreleasePool:
+    """Fallback for non-macOS/test environments."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+_AutoreleasePool = _NoopAutoreleasePool
+
+
+def _pooled(fn):
+    """Drain Objective-C temporaries around native HID boundary calls."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _AutoreleasePool():
+            return fn(*args, **kwargs)
+    return wrapper
+
+
 if sys.platform == "darwin":
     try:
         import ctypes
@@ -480,7 +504,7 @@ if sys.platform == "darwin":
             print(f"[HidGesture] NSAutoreleasePool unavailable: {_pool_exc}")
             _OBJC_POOL_OK = False
 
-        class _AutoreleasePool:
+        class _MacAutoreleasePool:
             __slots__ = ("_pool",)
 
             def __enter__(self):
@@ -496,12 +520,7 @@ if sys.platform == "darwin":
                     _objc_rt.objc_msgSend(pool, _SEL_DRAIN)
                 return False
 
-        def _pooled(fn):
-            @functools.wraps(fn)
-            def wrapper(*args, **kwargs):
-                with _AutoreleasePool():
-                    return fn(*args, **kwargs)
-            return wrapper
+        _AutoreleasePool = _MacAutoreleasePool
 
         _MAC_NATIVE_OK = True
     except Exception as exc:
@@ -1482,6 +1501,7 @@ class HidGestureListener:
 
     # ── low-level HID++ I/O ───────────────────────────────────────
 
+    @_pooled
     def _tx(self, report_id, feat, func, params):
         """Transmit an HID++ message.  Always uses 20-byte long format
         because BLE HID collections typically only support long output reports."""
@@ -1496,6 +1516,7 @@ class HidGestureListener:
         with self._tx_lock:
             self._dev.write(buf)
 
+    @_pooled
     def _rx(self, timeout_ms=2000):
         """Read one HID input report (blocking with timeout).
         Raises on device error (e.g., disconnection) so callers
@@ -2784,6 +2805,7 @@ class HidGestureListener:
                     except Exception:
                         pass
 
+    @_pooled
     def _on_report(self, raw):
         """Inspect an incoming HID++ report for diverted button / raw XY events."""
         msg = _parse(raw)
@@ -2924,6 +2946,28 @@ class HidGestureListener:
             return (-score,) + _default_priority(info)
 
         infos.sort(key=_priority)
+
+        # On macOS, a cached IOKit candidate can otherwise win over the
+        # equivalent hidapi vendor interface even when hidapi has been put in
+        # non-exclusive mode.  That sends all wheel reports through the
+        # Python/ctypes IOKit callback path that is most sensitive to native
+        # per-report retention.  Prefer a hidapi path globally, while keeping
+        # the IOKit candidates behind it as a real fallback if hidapi cannot
+        # open or probe the device.
+        if (
+            sys.platform == "darwin"
+            and _BACKEND_PREFERENCE == "auto"
+            and _HIDAPI_NONEXCLUSIVE_CONFIGURED
+        ):
+            hidapi_infos = [info for info in infos if info.get("path")]
+            if hidapi_infos:
+                infos[:] = hidapi_infos + [
+                    info for info in infos if not info.get("path")
+                ]
+                print(
+                    "[HidGesture] Preferring non-exclusive hidapi interface "
+                    "over native IOKit callback path"
+                )
 
         print(f"[HidGesture] Backend preference: {_BACKEND_PREFERENCE}")
         print(f"[HidGesture] Candidate HID interfaces: {len(infos)}")

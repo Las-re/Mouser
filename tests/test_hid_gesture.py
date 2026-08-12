@@ -116,6 +116,28 @@ class HidBackendPreferenceTests(unittest.TestCase):
 
         setter.assert_called_once_with(0)
 
+    def test_pooled_decorator_drains_the_active_pool(self):
+        entered = []
+
+        class ProbePool:
+            def __enter__(self):
+                entered.append("enter")
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                entered.append("exit")
+                return False
+
+        with patch.object(hid_gesture, "_AutoreleasePool", ProbePool):
+            @hid_gesture._pooled
+            def native_call(value):
+                entered.append(value)
+                return value + 1
+
+            self.assertEqual(native_call(4), 5)
+
+        self.assertEqual(entered, ["enter", 4, "exit"])
+
 
 class GestureCandidateSelectionTests(unittest.TestCase):
     def test_choose_gesture_candidates_prefers_known_device_cids(self):
@@ -264,6 +286,59 @@ class HidEnumerationFallbackTests(unittest.TestCase):
             )
         )
         self.assertEqual(listener.connected_device.display_name, "MX Master 3S")
+
+    def test_macos_auto_prefers_nonexclusive_hidapi_over_cached_iokit(self):
+        listener = hid_gesture.HidGestureListener()
+        iokit_info = {
+            "product_id": 0xB015,
+            "usage_page": 0x0001,
+            "usage": 0x0006,
+            "transport": "Bluetooth Low Energy",
+            "product_string": "M720 Triathlon",
+            "source": "iokit-enumerate",
+        }
+        hidapi_info = {
+            "product_id": 0xB015,
+            "usage_page": 0xFF43,
+            "usage": 0x0202,
+            "product_string": "M720 Triathlon",
+            "source": "hidapi-enumerate",
+            "path": b"DevSrvsID:test",
+        }
+        fake_dev = _FakeHidDevice()
+
+        def fake_find_feature(feature_id, *, timeout_ms=None):
+            if feature_id == hid_gesture.FEAT_REPROG_V4:
+                return 0x0B
+            return None
+
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(hid_gesture, "HIDAPI_OK", True),
+            patch.object(hid_gesture, "_HID_API_STYLE", "hidapi"),
+            patch.object(hid_gesture, "_BACKEND_PREFERENCE", "auto"),
+            patch.object(hid_gesture, "_HIDAPI_NONEXCLUSIVE_CONFIGURED", True),
+            patch.object(hid_gesture, "_MAC_NATIVE_OK", True),
+            patch.object(
+                hid_gesture,
+                "_hid",
+                SimpleNamespace(device=lambda: fake_dev),
+                create=True,
+            ),
+            patch.object(
+                listener,
+                "_vendor_hid_infos",
+                return_value=[iokit_info, hidapi_info],
+            ),
+            patch.object(listener, "_find_feature", side_effect=fake_find_feature),
+            patch.object(listener, "_discover_reprog_controls", return_value=[]),
+            patch.object(listener, "_divert", return_value=True),
+            patch.object(listener, "_divert_extras"),
+            patch("builtins.print"),
+        ):
+            self.assertTrue(listener._try_connect())
+
+        fake_dev.open_path.assert_called_once_with(b"DevSrvsID:test")
 
     def test_vendor_hid_infos_logs_when_logitech_interfaces_are_filtered_out(self):
         info = {

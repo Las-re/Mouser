@@ -88,6 +88,27 @@ class MouseHook(BaseMouseHook):
             if value:
                 Quartz.CGEventSetIntegerValueField(cg_event, field, -value)
 
+    def _scroll_event_needs_interception(self):
+        """Return whether the tap has any work to do for scroll events.
+
+        The tap is global, so it still receives ordinary vertical wheel events
+        even when the active profile has no horizontal-scroll mapping and
+        native inversion is off.  Avoid crossing the PyObjC/Quartz bridge for
+        those pass-through events; scrolling can generate thousands of them in
+        a short session and the bridge is the remaining native-retention
+        hotspot on affected macOS releases.
+        """
+        if (
+            (self.invert_vscroll or self.invert_hscroll)
+            and not self.wheel_native_invert_active
+        ):
+            return True
+        scroll_events = (MouseEvent.HSCROLL_LEFT, MouseEvent.HSCROLL_RIGHT)
+        return any(
+            event_type in self._blocked_events or event_type in self._callbacks
+            for event_type in scroll_events
+        )
+
     def _post_shift_hscroll_event(self, cg_event):
         """Translate Shift+vertical-wheel into a horizontal scroll event.
 
@@ -159,58 +180,6 @@ class MouseHook(BaseMouseHook):
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, new_event)
         return True
 
-    def _post_inverted_scroll_event(self, cg_event):
-        v_point = Quartz.CGEventGetIntegerValueField(
-            cg_event, Quartz.kCGScrollWheelEventPointDeltaAxis1
-        )
-        h_point = Quartz.CGEventGetIntegerValueField(
-            cg_event, Quartz.kCGScrollWheelEventPointDeltaAxis2
-        )
-        if self.invert_vscroll:
-            v_point = -v_point
-        if self.invert_hscroll:
-            h_point = -h_point
-
-        inverted = Quartz.CGEventCreateScrollWheelEvent(
-            None,
-            Quartz.kCGScrollEventUnitPixel,
-            2,
-            v_point,
-            h_point,
-        )
-        if not inverted:
-            return False
-        Quartz.CGEventSetFlags(inverted, Quartz.CGEventGetFlags(cg_event))
-        Quartz.CGEventSetIntegerValueField(
-            inverted, Quartz.kCGEventSourceUserData, _SCROLL_INVERT_MARKER
-        )
-        for axis in (1, 2):
-            sign = -1 if (
-                (axis == 1 and self.invert_vscroll)
-                or (axis == 2 and self.invert_hscroll)
-            ) else 1
-            for field_name in (
-                f"kCGScrollWheelEventDeltaAxis{axis}",
-                f"kCGScrollWheelEventFixedPtDeltaAxis{axis}",
-                f"kCGScrollWheelEventPointDeltaAxis{axis}",
-            ):
-                field = getattr(Quartz, field_name, None)
-                if field is None:
-                    continue
-                value = Quartz.CGEventGetIntegerValueField(cg_event, field)
-                Quartz.CGEventSetIntegerValueField(inverted, field, sign * value)
-        for field_name in (
-            "kCGScrollWheelEventScrollPhase",
-            "kCGScrollWheelEventMomentumPhase",
-        ):
-            field = getattr(Quartz, field_name, None)
-            if field is None:
-                continue
-            value = Quartz.CGEventGetIntegerValueField(cg_event, field)
-            Quartz.CGEventSetIntegerValueField(inverted, field, value)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, inverted)
-        return True
-
     def _emit_gesture_swipe(self, mouse_event):
         self._enqueue_dispatch_event(mouse_event)
 
@@ -252,6 +221,15 @@ class MouseHook(BaseMouseHook):
             if not self._first_event_logged:
                 self._first_event_logged = True
                 print("[MouseHook] CGEventTap: first event received", flush=True)
+
+            # Do this before reading source-user-data.  An ordinary vertical
+            # wheel is a pure pass-through when no scroll mapping or software
+            # inversion is active, so it should not cross Quartz at all.
+            if (
+                event_type == Quartz.kCGEventScrollWheel
+                and not self._scroll_event_needs_interception()
+            ):
+                return cg_event
 
             try:
                 if (
@@ -422,9 +400,11 @@ class MouseHook(BaseMouseHook):
                     mouse_event = None
                 if should_block:
                     return None
-                if (self.invert_vscroll or self.invert_hscroll) and not self.wheel_native_invert_active:
-                    if self._post_inverted_scroll_event(cg_event):
-                        return None
+                if not self.wheel_native_invert_active:
+                    if self.invert_vscroll:
+                        self._negate_scroll_axis(cg_event, 1)
+                    if self.invert_hscroll:
+                        self._negate_scroll_axis(cg_event, 2)
 
             if mouse_event:
                 self._enqueue_dispatch_event(mouse_event)
