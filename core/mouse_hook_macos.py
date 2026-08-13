@@ -2,6 +2,7 @@
 macOS mouse hook implementation.
 """
 
+import ctypes
 import functools
 import queue
 import sys
@@ -29,6 +30,121 @@ except ImportError:
         "[MouseHook] pyobjc-framework-Quartz not installed — "
         "pip install pyobjc-framework-Quartz"
     )
+
+
+# ── Native CGEvent bridge (ctypes) ──────────────────────────────────────
+# The CGEventTap callback must NOT go through PyObjC.  PyObjC leaks one
+# CGEventRef proxy -- and with it the retained CGEvent, its CGSEventAppendix
+# and the backing HIDEvents -- every single time a tap callback returns the
+# event it was handed.  At normal mouse-event rates that is tens of megabytes
+# per hour of unreclaimable native memory (issues #233 / #238); it is the
+# residual growth that survived every autorelease-pool fix, because the
+# leaked references are hard refcounts, not autoreleased temporaries.
+#
+# Driving the tap through ctypes keeps the event a raw pointer for its whole
+# trip through the callback, so nothing is retained and nothing leaks.
+# Returning the pointer passes the event through, returning None blocks it --
+# exactly the CGEventTapCallBack contract.
+_CG_CTYPES_OK = False
+_cg = None
+_cf = None
+_CG_TAP_CALLBACK = None
+_kCFRunLoopCommonModes = None
+
+if sys.platform == "darwin":
+    try:
+        from ctypes import c_bool, c_int64, c_long, c_uint32, c_uint64, c_void_p
+
+        _cg = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        _cf = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        _CG_TAP_CALLBACK = ctypes.CFUNCTYPE(
+            c_void_p, c_void_p, c_uint32, c_void_p, c_void_p
+        )
+        _cg.CGEventTapCreate.argtypes = [
+            c_uint32, c_uint32, c_uint32, c_uint64, _CG_TAP_CALLBACK, c_void_p,
+        ]
+        _cg.CGEventTapCreate.restype = c_void_p
+        _cg.CGEventTapEnable.argtypes = [c_void_p, c_bool]
+        _cg.CGEventTapEnable.restype = None
+        _cg.CGEventTapIsEnabled.argtypes = [c_void_p]
+        _cg.CGEventTapIsEnabled.restype = c_bool
+        _cg.CGEventGetIntegerValueField.argtypes = [c_void_p, c_uint32]
+        _cg.CGEventGetIntegerValueField.restype = c_int64
+        _cg.CGEventSetIntegerValueField.argtypes = [c_void_p, c_uint32, c_int64]
+        _cg.CGEventSetIntegerValueField.restype = None
+        _cg.CGEventGetFlags.argtypes = [c_void_p]
+        _cg.CGEventGetFlags.restype = c_uint64
+        _cg.CGEventSetFlags.argtypes = [c_void_p, c_uint64]
+        _cg.CGEventSetFlags.restype = None
+
+        _cf.CFMachPortCreateRunLoopSource.argtypes = [c_void_p, c_void_p, c_long]
+        _cf.CFMachPortCreateRunLoopSource.restype = c_void_p
+        _cf.CFRunLoopGetCurrent.argtypes = []
+        _cf.CFRunLoopGetCurrent.restype = c_void_p
+        _cf.CFRunLoopAddSource.argtypes = [c_void_p, c_void_p, c_void_p]
+        _cf.CFRunLoopAddSource.restype = None
+        _cf.CFRunLoopRemoveSource.argtypes = [c_void_p, c_void_p, c_void_p]
+        _cf.CFRunLoopRemoveSource.restype = None
+        _cf.CFRelease.argtypes = [c_void_p]
+        _cf.CFRelease.restype = None
+        _kCFRunLoopCommonModes = c_void_p.in_dll(_cf, "kCFRunLoopCommonModes")
+
+        _CG_CTYPES_OK = True
+    except Exception as exc:  # pragma: no cover - platform/runtime dependent
+        print(f"[MouseHook] native CGEvent bridge unavailable: {exc}")
+
+
+def _is_native_ref(ref):
+    """True when ``ref`` is a raw CoreGraphics pointer from the ctypes tap.
+
+    Events delivered by the ctypes callback arrive as plain ints.  Anything
+    else -- a PyObjC proxy created by this module, or a test double -- goes
+    through Quartz so both worlds keep working from one code path.
+    """
+    return _CG_CTYPES_OK and isinstance(ref, int) and not isinstance(ref, bool)
+
+
+def _event_get_int(cg_event, field):
+    if _is_native_ref(cg_event):
+        return _cg.CGEventGetIntegerValueField(cg_event, field)
+    return Quartz.CGEventGetIntegerValueField(cg_event, field)
+
+
+def _event_set_int(cg_event, field, value):
+    if _is_native_ref(cg_event):
+        _cg.CGEventSetIntegerValueField(cg_event, field, value)
+        return
+    Quartz.CGEventSetIntegerValueField(cg_event, field, value)
+
+
+def _event_get_flags(cg_event):
+    if _is_native_ref(cg_event):
+        return _cg.CGEventGetFlags(cg_event)
+    return Quartz.CGEventGetFlags(cg_event)
+
+
+def _event_set_flags(cg_event, flags):
+    if _is_native_ref(cg_event):
+        _cg.CGEventSetFlags(cg_event, flags)
+        return
+    Quartz.CGEventSetFlags(cg_event, flags)
+
+
+def _tap_enable(tap, enabled):
+    if _is_native_ref(tap):
+        _cg.CGEventTapEnable(tap, enabled)
+        return
+    Quartz.CGEventTapEnable(tap, enabled)
+
+
+def _tap_is_enabled(tap):
+    if _is_native_ref(tap):
+        return bool(_cg.CGEventTapIsEnabled(tap))
+    return Quartz.CGEventTapIsEnabled(tap)
 
 
 def _autoreleased(fn):
@@ -67,6 +183,8 @@ class MouseHook(BaseMouseHook):
         self._running = False
         self._tap = None
         self._tap_source = None
+        self._tap_callback_ref = None
+        self._tap_runloop = None
         self.ignore_trackpad = True
         self._wake_observer = None
         self._session_resign_observer = None
@@ -84,9 +202,9 @@ class MouseHook(BaseMouseHook):
             field = getattr(Quartz, field_name, None)
             if field is None:
                 continue
-            value = Quartz.CGEventGetIntegerValueField(cg_event, field)
+            value = _event_get_int(cg_event, field)
             if value:
-                Quartz.CGEventSetIntegerValueField(cg_event, field, -value)
+                _event_set_int(cg_event, field, -value)
 
     def _scroll_event_needs_interception(self):
         """Return whether the tap has any work to do for scroll events.
@@ -117,13 +235,13 @@ class MouseHook(BaseMouseHook):
         translate Shift+scroll themselves do not double-translate.  The
         `invert_hscroll` setting flips the direction.
         """
-        v_line = Quartz.CGEventGetIntegerValueField(
+        v_line = _event_get_int(
             cg_event, Quartz.kCGScrollWheelEventDeltaAxis1
         )
-        v_fixed = Quartz.CGEventGetIntegerValueField(
+        v_fixed = _event_get_int(
             cg_event, Quartz.kCGScrollWheelEventFixedPtDeltaAxis1
         )
-        v_point = Quartz.CGEventGetIntegerValueField(
+        v_point = _event_get_int(
             cg_event, Quartz.kCGScrollWheelEventPointDeltaAxis1
         )
 
@@ -132,7 +250,7 @@ class MouseHook(BaseMouseHook):
             v_fixed = -v_fixed
             v_point = -v_point
 
-        is_continuous = Quartz.CGEventGetIntegerValueField(cg_event, 88)
+        is_continuous = _event_get_int(cg_event, 88)
         if is_continuous:
             unit = Quartz.kCGScrollEventUnitPixel
             primary_delta = v_point
@@ -146,9 +264,9 @@ class MouseHook(BaseMouseHook):
         if not new_event:
             return False
 
-        flags = Quartz.CGEventGetFlags(cg_event)
-        Quartz.CGEventSetFlags(new_event, flags & ~Quartz.kCGEventFlagMaskShift)
-        Quartz.CGEventSetIntegerValueField(
+        flags = _event_get_flags(cg_event)
+        _event_set_flags(new_event, flags & ~Quartz.kCGEventFlagMaskShift)
+        _event_set_int(
             new_event,
             Quartz.kCGEventSourceUserData,
             _SHIFT_WHEEL_HSCROLL_MARKER,
@@ -165,7 +283,7 @@ class MouseHook(BaseMouseHook):
             field = getattr(Quartz, field_name, None)
             if field is None:
                 continue
-            Quartz.CGEventSetIntegerValueField(new_event, field, value)
+            _event_set_int(new_event, field, value)
 
         for field_name in (
             "kCGScrollWheelEventScrollPhase",
@@ -174,8 +292,8 @@ class MouseHook(BaseMouseHook):
             field = getattr(Quartz, field_name, None)
             if field is None:
                 continue
-            value = Quartz.CGEventGetIntegerValueField(cg_event, field)
-            Quartz.CGEventSetIntegerValueField(new_event, field, value)
+            value = _event_get_int(cg_event, field)
+            _event_set_int(new_event, field, value)
 
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, new_event)
         return True
@@ -200,6 +318,20 @@ class MouseHook(BaseMouseHook):
             with objc.autorelease_pool():
                 self._dispatch(event)
 
+    def _native_tap_callback(self, proxy, event_type, cg_event, refcon):
+        """ctypes entry point for the event tap.
+
+        ctypes turns an escaping exception into a NULL return, and NULL means
+        "drop this event" -- so an unexpected error here would silently eat
+        the user's clicks and scrolling.  Fall back to passing the event
+        through untouched instead.
+        """
+        try:
+            return self._event_tap_callback(proxy, event_type, cg_event, refcon)
+        except Exception as exc:
+            print(f"[MouseHook] event tap callback error: {exc}")
+            return cg_event
+
     @_autoreleased
     def _event_tap_callback(self, proxy, event_type, cg_event, refcon):
         try:
@@ -215,7 +347,7 @@ class MouseHook(BaseMouseHook):
                 # A pending owner-gesture release may have been dropped while
                 # the tap was disabled -- abort it so the cursor can't freeze.
                 self.abort_button_gesture("tap_disabled")
-                Quartz.CGEventTapEnable(self._tap, True)
+                _tap_enable(self._tap, True)
                 return cg_event
 
             if not self._first_event_logged:
@@ -233,9 +365,7 @@ class MouseHook(BaseMouseHook):
 
             try:
                 if (
-                    Quartz.CGEventGetIntegerValueField(
-                        cg_event, Quartz.kCGEventSourceUserData
-                    )
+                    _event_get_int(cg_event, Quartz.kCGEventSourceUserData)
                     == _INJECTED_EVENT_MARKER
                 ):
                     return cg_event
@@ -267,12 +397,8 @@ class MouseHook(BaseMouseHook):
                     Quartz.kCGEventOtherMouseDragged,
                 )
             ):
-                dx = Quartz.CGEventGetIntegerValueField(
-                    cg_event, Quartz.kCGMouseEventDeltaX
-                )
-                dy = Quartz.CGEventGetIntegerValueField(
-                    cg_event, Quartz.kCGMouseEventDeltaY
-                )
+                dx = _event_get_int(cg_event, Quartz.kCGMouseEventDeltaX)
+                dy = _event_get_int(cg_event, Quartz.kCGMouseEventDeltaY)
                 self.sample_button_gesture(dx, dy, "os_motion")
                 return None
 
@@ -286,12 +412,8 @@ class MouseHook(BaseMouseHook):
             ):
                 if not self._gesture_direction_enabled:
                     return cg_event
-                dx = Quartz.CGEventGetIntegerValueField(
-                    cg_event, Quartz.kCGMouseEventDeltaX
-                )
-                dy = Quartz.CGEventGetIntegerValueField(
-                    cg_event, Quartz.kCGMouseEventDeltaY
-                )
+                dx = _event_get_int(cg_event, Quartz.kCGMouseEventDeltaX)
+                dy = _event_get_int(cg_event, Quartz.kCGMouseEventDeltaY)
                 self._emit_debug(
                     f"Gesture move event type={int(event_type)} dx={dx} dy={dy}"
                 )
@@ -299,7 +421,7 @@ class MouseHook(BaseMouseHook):
                 return None
 
             if event_type == Quartz.kCGEventOtherMouseDown:
-                btn = Quartz.CGEventGetIntegerValueField(
+                btn = _event_get_int(
                     cg_event, Quartz.kCGMouseEventButtonNumber
                 )
                 if self.debug_mode and self._debug_callback:
@@ -324,7 +446,7 @@ class MouseHook(BaseMouseHook):
                     should_block = MouseEvent.XBUTTON2_DOWN in self._blocked_events
 
             elif event_type == Quartz.kCGEventOtherMouseUp:
-                btn = Quartz.CGEventGetIntegerValueField(
+                btn = _event_get_int(
                     cg_event, Quartz.kCGMouseEventButtonNumber
                 )
                 if self.debug_mode and self._debug_callback:
@@ -349,7 +471,7 @@ class MouseHook(BaseMouseHook):
                     should_block = MouseEvent.XBUTTON2_UP in self._blocked_events
 
             elif event_type == Quartz.kCGEventScrollWheel:
-                source_marker = Quartz.CGEventGetIntegerValueField(
+                source_marker = _event_get_int(
                     cg_event, Quartz.kCGEventSourceUserData
                 )
                 if source_marker in (
@@ -358,22 +480,22 @@ class MouseHook(BaseMouseHook):
                 ):
                     return cg_event
                 if self.ignore_trackpad:
-                    scroll_phase = Quartz.CGEventGetIntegerValueField(
+                    scroll_phase = _event_get_int(
                         cg_event, Quartz.kCGScrollWheelEventScrollPhase
                     )
-                    momentum_phase = Quartz.CGEventGetIntegerValueField(
+                    momentum_phase = _event_get_int(
                         cg_event, Quartz.kCGScrollWheelEventMomentumPhase
                     )
                     if scroll_phase != 0 or momentum_phase != 0:
                         return cg_event
-                h_delta = Quartz.CGEventGetIntegerValueField(
+                h_delta = _event_get_int(
                     cg_event, Quartz.kCGScrollWheelEventFixedPtDeltaAxis2
                 )
                 h_delta = h_delta / 65536.0
                 if self.debug_mode and self._debug_callback:
                     try:
                         v_delta = (
-                            Quartz.CGEventGetIntegerValueField(
+                            _event_get_int(
                                 cg_event,
                                 Quartz.kCGScrollWheelEventFixedPtDeltaAxis1,
                             )
@@ -383,9 +505,9 @@ class MouseHook(BaseMouseHook):
                     except Exception:
                         pass
                 if h_delta == 0:
-                    flags = Quartz.CGEventGetFlags(cg_event)
+                    flags = _event_get_flags(cg_event)
                     if flags & Quartz.kCGEventFlagMaskShift:
-                        v_fixed = Quartz.CGEventGetIntegerValueField(
+                        v_fixed = _event_get_int(
                             cg_event,
                             Quartz.kCGScrollWheelEventFixedPtDeltaAxis1,
                         )
@@ -443,8 +565,8 @@ class MouseHook(BaseMouseHook):
 
         def _re_enable_tap_and_reconnect(reason):
             if self._tap and self._running:
-                Quartz.CGEventTapEnable(self._tap, True)
-                ok = Quartz.CGEventTapIsEnabled(self._tap)
+                _tap_enable(self._tap, True)
+                ok = _tap_is_enabled(self._tap)
                 print(
                     f"[MouseHook] Event tap re-enabled ({reason}): "
                     f"{'OK' if ok else 'FAILED — may need restart'}",
@@ -517,16 +639,30 @@ class MouseHook(BaseMouseHook):
             | Quartz.CGEventMaskBit(Quartz.kCGEventScrollWheel)
         )
 
-        self._tap = Quartz.CGEventTapCreate(
-            Quartz.kCGSessionEventTap,
-            Quartz.kCGHeadInsertEventTap,
-            Quartz.kCGEventTapOptionDefault,
-            event_mask,
-            self._event_tap_callback,
-            None,
-        )
+        if _CG_CTYPES_OK:
+            # Hold the trampoline on the instance: ctypes callbacks are only
+            # kept alive by Python references, and a collected one would leave
+            # the tap calling freed memory.
+            self._tap_callback_ref = _CG_TAP_CALLBACK(self._native_tap_callback)
+            self._tap = _cg.CGEventTapCreate(
+                Quartz.kCGSessionEventTap,
+                Quartz.kCGHeadInsertEventTap,
+                Quartz.kCGEventTapOptionDefault,
+                event_mask,
+                self._tap_callback_ref,
+                None,
+            )
+        else:
+            self._tap = Quartz.CGEventTapCreate(
+                Quartz.kCGSessionEventTap,
+                Quartz.kCGHeadInsertEventTap,
+                Quartz.kCGEventTapOptionDefault,
+                event_mask,
+                self._event_tap_callback,
+                None,
+            )
 
-        if self._tap is None:
+        if not self._tap:
             print("[MouseHook] ERROR: Failed to create CGEventTap!")
             print("[MouseHook] Grant Accessibility permission in:")
             print(
@@ -536,13 +672,28 @@ class MouseHook(BaseMouseHook):
 
         print("[MouseHook] CGEventTap created successfully", flush=True)
 
-        self._tap_source = Quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
-        Quartz.CFRunLoopAddSource(
-            Quartz.CFRunLoopGetCurrent(),
-            self._tap_source,
-            Quartz.kCFRunLoopCommonModes,
-        )
-        Quartz.CGEventTapEnable(self._tap, True)
+        if _CG_CTYPES_OK:
+            self._tap_source = _cf.CFMachPortCreateRunLoopSource(
+                None, self._tap, 0
+            )
+            # Remember the run loop we attached to: stop() may run on another
+            # thread, and removing the source from the wrong run loop would
+            # leave the tap live and still delivering events.
+            self._tap_runloop = _cf.CFRunLoopGetCurrent()
+            _cf.CFRunLoopAddSource(
+                self._tap_runloop, self._tap_source, _kCFRunLoopCommonModes
+            )
+        else:
+            self._tap_source = Quartz.CFMachPortCreateRunLoopSource(
+                None, self._tap, 0
+            )
+            self._tap_runloop = Quartz.CFRunLoopGetCurrent()
+            Quartz.CFRunLoopAddSource(
+                self._tap_runloop,
+                self._tap_source,
+                Quartz.kCFRunLoopCommonModes,
+            )
+        _tap_enable(self._tap, True)
         print("[MouseHook] CGEventTap enabled and integrated with run loop", flush=True)
         self._running = True
 
@@ -565,15 +716,29 @@ class MouseHook(BaseMouseHook):
         self._connected_device = None
 
         if self._tap:
-            Quartz.CGEventTapEnable(self._tap, False)
+            _tap_enable(self._tap, False)
             if self._tap_source:
-                Quartz.CFRunLoopRemoveSource(
-                    Quartz.CFRunLoopGetCurrent(),
-                    self._tap_source,
-                    Quartz.kCFRunLoopCommonModes,
-                )
+                if _is_native_ref(self._tap_source):
+                    _cf.CFRunLoopRemoveSource(
+                        self._tap_runloop or _cf.CFRunLoopGetCurrent(),
+                        self._tap_source,
+                        _kCFRunLoopCommonModes,
+                    )
+                    # CFMachPortCreateRunLoopSource follows the create rule;
+                    # PyObjC used to release this for us.
+                    _cf.CFRelease(self._tap_source)
+                else:
+                    Quartz.CFRunLoopRemoveSource(
+                        self._tap_runloop or Quartz.CFRunLoopGetCurrent(),
+                        self._tap_source,
+                        Quartz.kCFRunLoopCommonModes,
+                    )
                 self._tap_source = None
+            if _is_native_ref(self._tap):
+                _cf.CFRelease(self._tap)
             self._tap = None
+            self._tap_runloop = None
+            self._tap_callback_ref = None
             print("[MouseHook] CGEventTap disabled and removed", flush=True)
 
         if self._dispatch_thread:
@@ -586,6 +751,10 @@ MouseHook._platform_module = sys.modules[__name__]
 
 __all__ = [
     "MouseHook",
+    "_CG_CTYPES_OK",
+    "_event_get_int",
+    "_event_set_int",
+    "_is_native_ref",
     "HidGestureListener",
     "Quartz",
     "_QUARTZ_OK",

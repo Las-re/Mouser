@@ -1563,5 +1563,118 @@ class GestureEventFamilyTests(unittest.TestCase):
         self.assertEqual(mouse_hook.MouseEvent.SENSE_SWIPE_LEFT, "sense_swipe_left")
 
 
+@unittest.skipUnless(sys.platform == "darwin", "macOS-only tests")
+class MacOSNativeEventTapBridgeTests(unittest.TestCase):
+    """Pin the CGEventTap to the raw-pointer (ctypes) bridge.
+
+    PyObjC leaks one CGEventRef proxy -- and with it the retained CGEvent,
+    its CGSEventAppendix and the backing HIDEvents -- every time a tap
+    callback returns the event it was handed. At ordinary mouse-event rates
+    that is tens of MB/hour of native memory that no autorelease pool can
+    reclaim, because the leaked references are hard refcounts. Driving the
+    tap through ctypes keeps the event a plain pointer for its whole trip
+    through the callback, so nothing is ever retained.
+    """
+
+    _kCGEventMouseMoved = 5
+    _kCGEventScrollWheel = 22
+
+    def setUp(self):
+        self.mock_quartz = MagicMock(name="Quartz")
+        self.mock_quartz.kCGEventMouseMoved = self._kCGEventMouseMoved
+        self.mock_quartz.kCGEventScrollWheel = self._kCGEventScrollWheel
+        mouse_hook.Quartz = self.mock_quartz
+        # Never let a synthetic pointer reach real CoreGraphics.
+        self._real_cg = mouse_hook._cg
+        self.mock_cg = MagicMock(name="CoreGraphics")
+        self.mock_cg.CGEventGetIntegerValueField.return_value = 0
+        self.mock_cg.CGEventGetFlags.return_value = 0
+        mouse_hook._cg = self.mock_cg
+
+    def tearDown(self):
+        mouse_hook._cg = self._real_cg
+        if hasattr(mouse_hook, "Quartz") and isinstance(
+                mouse_hook.Quartz, MagicMock):
+            del mouse_hook.Quartz
+
+    def _hook(self):
+        hook = mouse_hook.MouseHook()
+        hook._running = True
+        hook._tap = MagicMock(name="tap")
+        hook._connected_device = SimpleNamespace(
+            key="mx_master_3s", thumb_button_via_hid=False)
+        return hook
+
+    def test_ctypes_bridge_is_active_on_macos(self):
+        self.assertTrue(mouse_hook._CG_CTYPES_OK)
+        # Raw pointer in, raw pointer out -- never a PyObjC proxy.
+        import ctypes
+        self.assertIs(mouse_hook._CG_TAP_CALLBACK._restype_, ctypes.c_void_p)
+
+    def test_pointer_events_bypass_pyobjc_accessors(self):
+        mouse_hook._event_get_int(0x1234, 42)
+        self.mock_cg.CGEventGetIntegerValueField.assert_called_once_with(
+            0x1234, 42)
+        self.mock_quartz.CGEventGetIntegerValueField.assert_not_called()
+
+    def test_proxy_events_still_use_pyobjc_accessors(self):
+        # Events this module creates itself (Shift+wheel translation) stay
+        # PyObjC objects and must keep working through the same helpers.
+        proxy = MagicMock(name="cg_event_proxy")
+        mouse_hook._event_set_int(proxy, 42, 7)
+        self.mock_quartz.CGEventSetIntegerValueField.assert_called_once_with(
+            proxy, 42, 7)
+        self.mock_cg.CGEventSetIntegerValueField.assert_not_called()
+
+    def test_bool_is_not_treated_as_an_event_pointer(self):
+        mouse_hook._event_get_int(True, 42)
+        self.mock_quartz.CGEventGetIntegerValueField.assert_called_once_with(
+            True, 42)
+        self.mock_cg.CGEventGetIntegerValueField.assert_not_called()
+
+    def test_passthrough_returns_the_same_pointer_it_was_given(self):
+        """The identity of the return value is the whole fix: handing back
+        the untouched pointer is what stops the event being retained."""
+        hook = self._hook()
+        cg_event = 0xDEADBEEF
+
+        result = hook._event_tap_callback(
+            None, self._kCGEventMouseMoved, cg_event, None)
+
+        self.assertIs(result, cg_event)
+
+    def test_blocked_event_still_returns_none(self):
+        hook = self._hook()
+        hook.invert_vscroll = True
+        hook.block(mouse_hook.MouseEvent.HSCROLL_RIGHT)
+        # A horizontal wheel delta the profile blocks.
+        self.mock_cg.CGEventGetIntegerValueField.side_effect = (
+            lambda ev, field: 65536 if field ==
+            self.mock_quartz.kCGScrollWheelEventFixedPtDeltaAxis2 else 0)
+
+        result = hook._event_tap_callback(
+            None, self._kCGEventScrollWheel, 0xDEADBEEF, None)
+
+        self.assertIsNone(result)
+
+    def test_native_entry_point_passes_event_through_on_error(self):
+        """ctypes turns an escaping exception into NULL, and NULL drops the
+        event -- an internal error must never eat the user's input."""
+        hook = self._hook()
+        cg_event = 0xDEADBEEF
+        with patch.object(hook, "_event_tap_callback",
+                          side_effect=RuntimeError("boom")):
+            result = hook._native_tap_callback(
+                None, self._kCGEventMouseMoved, cg_event, None)
+
+        self.assertIs(result, cg_event)
+
+    def test_start_keeps_a_reference_to_the_ctypes_trampoline(self):
+        """A collected CFUNCTYPE would leave the tap calling freed memory."""
+        hook = mouse_hook.MouseHook()
+        self.assertIsNone(hook._tap_callback_ref)
+        self.assertTrue(hasattr(hook, "_tap_runloop"))
+
+
 if __name__ == "__main__":
     unittest.main()

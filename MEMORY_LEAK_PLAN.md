@@ -120,6 +120,77 @@ confound.
 
 ---
 
+## 2.5 Root cause found — PyObjC leaks one CGEvent per tap callback return
+
+*Added 2026-08-13, measured on macOS 26.5 (25F71), M720 Triathlon, pyobjc-core 12.2.1.*
+
+The residual growth that survived every autorelease-pool fix is **not** an
+autorelease problem at all, and it is not in the HID path. It is in the
+CGEventTap callback, and it is a hard refcount leak inside the PyObjC bridge.
+
+### Evidence
+
+`heap` on a long-running v3.7.3 process shows the three retained classes
+growing in exact lockstep, one per event, while `leaks` reports only ~19 KB of
+genuinely unreachable memory — the growth is *reachable* retained memory:
+
+| Class | 75 s delta | ratio |
+|---|---|---|
+| `CGEvent` | +2,314 | 1× |
+| `CGSEventAppendix` | +2,313 | 1× |
+| `NSMutableArray` (+ storage) | +2,315 | 1× |
+| `HIDEvent` | +6,945 | 3× |
+
+`leaks --traceTree` on any retained `CGEvent` points at a Python obmalloc
+arena: the retaining object is a **Python** `CGEventRef` proxy.
+
+### Reduction
+
+A standalone listen-only CGEventTap whose callback does nothing but
+`return event` reproduces it exactly — with no Mouser code involved:
+
+| callback | callbacks seen | Python objects retained |
+|---|---|---|
+| `return event` (PyObjC proxy) | 300 | **+305** |
+| `return None` | 300 | +5 |
+| `return objc.pyobjc_id(event)` | **38,560** (re-delivery storm) | +5 |
+| ctypes tap, `return` raw pointer | 300 | +5 |
+
+Returning the proxy leaks one proxy — and the CGEvent, appendix and HIDEvents
+it retains — per invocation. Returning a bare pointer *value* through PyObjC
+is not a workaround: it breaks the tap and causes an event re-delivery storm.
+Only taking the tap off PyObjC entirely fixes it.
+
+### Why earlier isolation runs pointed the wrong way
+
+The `MOUSER_DISABLE_HID_LISTENER=1` control run looked like it exonerated
+Quartz, but it did not exercise the tap: `_should_intercept_events()` returns
+`self._connected_device is not None`, so with no HID listener there is no
+connected device and the callback returns at the KVM guard before doing any
+work. That run measured a no-op tap, not a working one. This is also why the
+leak looked like "an interaction between the HID and CGEvent paths" — the HID
+listener is simply what makes the tap callback do its job.
+
+### Fix
+
+`core/mouse_hook_macos.py` now creates the tap with `ctypes`
+(`CGEventTapCreate` + a `CFUNCTYPE(c_void_p, c_void_p, c_uint32, c_void_p,
+c_void_p)` trampoline). The event stays a raw pointer for its whole trip
+through the callback; pass-through returns the pointer, blocking returns
+`None`. Field access goes through `_event_get_int` / `_event_set_int` /
+`_event_get_flags` / `_event_set_flags`, which dispatch to `ctypes` for raw
+pointers and to Quartz for the PyObjC events this module still creates itself
+(Shift+wheel translation), so the existing tests and code paths are unchanged.
+
+Measured A/B on the real hook, 600 synthetic mouse-moved events:
+
+| | `CGEvent` | `CGSEventAppendix` | Python objects |
+|---|---|---|---|
+| before | **+600** | **+600** | +618 |
+| after | **0** | **0** | +16 |
+
+---
+
 ## 3. Action plan
 
 ### Phase 0 — Land the validated fixes (immediately)
